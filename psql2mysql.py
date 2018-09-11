@@ -16,15 +16,19 @@
 #
 
 import re
+import six
 from oslo_config import cfg
 from oslo_log import log as logging
 from prettytable import PrettyTable
-
-from sqlalchemy import create_engine, MetaData, or_, text
+from sqlalchemy import create_engine, MetaData, or_, text, types
 
 
 LOG = logging.getLogger(__name__)
 
+
+regex = re.compile(
+    six.u(r'[\U00010000-\U0010ffff]')
+)
 
 class DbWrapper(object):
     def __init__(self, uri=""):
@@ -44,6 +48,19 @@ class DbWrapper(object):
         metadata.reflect()
         return metadata.tables
 
+
+    # adapt given query so it excludes deleted items
+    def _exclude_deleted(self, table, query):
+        if not cfg.CONF.exclude_deleted:
+            return query
+        if not "deleted" in table.columns:
+            return query
+        if isinstance(table.columns["deleted"].type, types.INTEGER):
+            return query.where(table.c.deleted == 0)
+        if isinstance(table.columns["deleted"].type, types.VARCHAR):
+            return query.where(table.c.deleted == 'False')
+        return query.where(table.c.deleted == False)
+
     def getStringColumns(self, table):
         columns = table.columns
         textColumns = [
@@ -59,25 +76,32 @@ class DbWrapper(object):
             text("\"%s\" ~ '[\\x10000-\\x10ffff]'" % x) for x in stringColumns
         ]
         q = table.select().where(or_(f for f in filters))
-        result = q.execute()
+        result = _exclude_deleted(table, q).execute()
         return result
 
     def scanTablefor4ByteUtf8Char(self, table):
         stringColumns = self.getStringColumns(table)
-        LOG.info("Scanning Table %s (columns: %s) for problematic UTF8 "
+        LOG.debug("Scanning Table %s (columns: %s) for problematic UTF8 "
                  "characters", table.name, stringColumns)
         rows = self._query_utf8mb4_rows(table, stringColumns)
-        incompatible_rows = []
+        incompatible = []
+        primary_keys = []
+        if not table.primary_key == None:
+          primary_keys = list(table.primary_key)
         for row in rows:
             for col in stringColumns:
-                if type(row[col]) is not unicode:
+                if not isinstance(row[col], six.string_types):
                     continue
-                if re.search(ur'[\U00010000-\U0010ffff]', row[col]):
-                    incompatible_rows.append((col, row))
-        return incompatible_rows
+                if regex.search(row[col]):
+                    incompatible.append({
+                      "column": col,
+                      "value": row[col],
+                      "primary": ["%s=%s" % (k.name, row[k.name]) for k in primary_keys]
+                    })
+        return incompatible
 
     def readTableRows(self, table):
-        return self.engine.execute(table.select())
+        return self.engine.execute(self._exclude_deleted(table, table.select()))
 
     # FIXME move this to a MariaDB specific class?
     def disable_constraints(self):
@@ -152,7 +176,7 @@ class DbDataMigrator(object):
                 # huge transcation?
                 self.target_db.writeTableRows(target_tables[table.name], result)
             else:
-                LOG.info("Table '%s' is empty" % table.name)
+                LOG.debug("Table '%s' is empty" % table.name)
 
 
 def add_subcommands(subparsers):
@@ -176,19 +200,27 @@ def do_prechecks(config):
     db.connect()
     tables = db.getSortedTables()
     for table in tables:
-        rows = db.scanTablefor4ByteUtf8Char(table)
-        if rows:
-            print("Table '%s' contains 4 Byte UTF8 characters, which are, "
+        incompatibles = db.scanTablefor4ByteUtf8Char(table)
+        if incompatibles:
+            print("Table '%s' contains 4 Byte UTF8 characters which are "
                   "incompatible with the 'utf8' encoding used by MariaDB" %
                   table.name
             )
-            print("The following rows are affected.")
-            x = PrettyTable()
-            x.field_names = ["Affected Column"] + list(table.columns)
-            for row in rows:
-                x.add_row([row[0]] + list(row[1]))
-            print x
-            raise Exception("UTF8 mb4 found")
+            print("The following rows are affected:")
+
+            output_table = PrettyTable()
+            output_table.field_names = [
+                "Primary Key",
+                "Affected Column",
+                "Value"
+            ]
+
+            for item in incompatibles:
+                output_table.add_row([', '.join(item["primary"]),
+                                      item['column'],
+                                      item['value']])
+            print(output_table)
+            raise Exception("4 Byte UTF8 characters found in the source database.")
         ## FIXME add check for overly long (>64k) Text columns here
 
 def do_migration(config):
@@ -210,6 +242,9 @@ if __name__ == '__main__':
         cfg.StrOpt('target',
                    required=False,
                    help='connection URL to the target server'),
+        cfg.BoolOpt('exclude-deleted',
+                    default=True,
+                    help='Exclude table columns marked as deleted. True by default.')
     ]
 
     cfg.CONF.register_cli_opts(cli_opts)
